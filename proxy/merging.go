@@ -81,6 +81,17 @@ func parallelMerge(timeout time.Duration, rc ResponseCombiner, next ...Proxy) Pr
 
 var reMergeKey = regexp.MustCompile(`\{\{\.Resp(\d+)_([\d\w-_\.]+)\}\}`)
 
+func isBlocking(i int, deps [][]int) bool {
+	for _, dep := range deps {
+		for _, j := range dep {
+			if i == j {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func sequentialMerge(patterns []string, timeout time.Duration, rc ResponseCombiner, next ...Proxy) Proxy {
 	deps := make([][]int, len(patterns))
 	matches := make([][][]string, len(patterns))
@@ -182,12 +193,12 @@ func sequentialMerge(patterns []string, timeout time.Duration, rc ResponseCombin
 				case err := <-errCh:
 					ch <- partResult{i, err}
 				case response := <-out:
+					parts[i] = response
+					close(done[i])
 					if !response.IsComplete {
 						cancel()
 						return
 					}
-					parts[i] = response
-					close(done[i])
 					ch <- partResult{i, nil}
 				}
 			}(i)
@@ -197,20 +208,21 @@ func sequentialMerge(patterns []string, timeout time.Duration, rc ResponseCombin
 			select {
 			case res := <-ch:
 				if i, err := res.i, res.err; err != nil {
-					if i == 0 {
-						cancel()
-						return nil, err
-					}
 					acc.Merge(nil, err)
+					if isBlocking(i, deps) {
+						cancel()
+						break
+					}
 				}
 			case <-localCtx.Done():
-				acc.Merge(nil, localCtx.Err())
 				break
 			}
 		}
 
 		for _, part := range parts {
-			acc.Merge(part, nil)
+			if part != nil {
+				acc.Merge(part, nil)
+			}
 		}
 
 		result, err := acc.Result()
@@ -256,7 +268,14 @@ func (i *incrementalMergeAccumulator) Merge(res *Response, err error) {
 
 func (i *incrementalMergeAccumulator) Result() (*Response, error) {
 	if i.data == nil {
-		return &Response{Data: make(map[string]interface{}, 0), IsComplete: false}, newMergeError(i.errs)
+		err := newMergeError(i.errs)
+
+		// none succeeded
+		if len(i.errs) == 1 {
+			return nil, err
+		}
+
+		return &Response{Data: make(map[string]interface{}, 0), IsComplete: false}, err
 	}
 
 	if i.pending != 0 || len(i.errs) != 0 {
@@ -290,6 +309,8 @@ func requestPart(ctx context.Context, next Proxy, request *Request, out chan<- *
 func newMergeError(errs []error) error {
 	if len(errs) == 0 {
 		return nil
+	} else if len(errs) == 1 {
+		return errs[0]
 	}
 	return mergeError{errs}
 }
